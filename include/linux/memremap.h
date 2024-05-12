@@ -6,6 +6,7 @@
 #include <linux/range.h>
 #include <linux/ioport.h>
 #include <linux/percpu-refcount.h>
+#include <linux/pks.h>
 
 struct resource;
 struct device;
@@ -82,6 +83,7 @@ struct dev_pagemap_ops {
 };
 
 #define PGMAP_ALTMAP_VALID	(1 << 0)
+#define PGMAP_PROTECTION	(1 << 1)
 
 /**
  * struct dev_pagemap - metadata for ZONE_DEVICE mappings
@@ -213,5 +215,76 @@ static inline void put_dev_pagemap(struct dev_pagemap *pgmap)
 	if (pgmap)
 		percpu_ref_put(&pgmap->ref);
 }
+
+#ifdef CONFIG_DEVMAP_ACCESS_PROTECTION
+
+static inline bool pgmap_protection_available(void)
+{
+	return pks_available();
+}
+
+DECLARE_STATIC_KEY_FALSE(dev_pgmap_protection_static_key);
+
+/*
+ * devmap_protected() requires a reference on the page to ensure there is no
+ * races with dev_pagemap tear down.
+ */
+static inline bool devmap_protected(struct page *page)
+{
+	if (!static_branch_unlikely(&dev_pgmap_protection_static_key))
+		return false;
+	if (!is_zone_device_page(page))
+		return false;
+	if (page->pgmap->flags & PGMAP_PROTECTION)
+		return true;
+	return false;
+}
+
+void __pgmap_set_readwrite(struct dev_pagemap *pgmap);
+void __pgmap_set_noaccess(struct dev_pagemap *pgmap);
+
+static inline bool pgmap_check_pgmap_prot(struct page *page)
+{
+	if (!devmap_protected(page))
+		return false;
+
+	/*
+	 * There is no known use case to change permissions in an irq for pgmap
+	 * pages
+	 */
+	lockdep_assert_in_irq();
+	return true;
+}
+
+static inline void pgmap_set_readwrite(struct page *page)
+{
+	if (!pgmap_check_pgmap_prot(page))
+		return;
+	__pgmap_set_readwrite(page->pgmap);
+}
+
+static inline void pgmap_set_noaccess(struct page *page)
+{
+	if (!pgmap_check_pgmap_prot(page))
+		return;
+	__pgmap_set_noaccess(page->pgmap);
+}
+
+bool pgmap_pks_fault_callback(struct pt_regs *regs, unsigned long address,
+			      bool write);
+
+#else
+
+static inline void __pgmap_set_readwrite(struct dev_pagemap *pgmap) { }
+static inline void __pgmap_set_noaccess(struct dev_pagemap *pgmap) { }
+static inline void pgmap_set_readwrite(struct page *page) { }
+static inline void pgmap_set_noaccess(struct page *page) { }
+
+static inline bool pgmap_protection_available(void)
+{
+	return false;
+}
+
+#endif /* CONFIG_DEVMAP_ACCESS_PROTECTION */
 
 #endif /* _LINUX_MEMREMAP_H_ */
